@@ -1,0 +1,351 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      # ==========================================
+      # 1. CONFIGURAR REMOTE DESKTOP
+      # ==========================================
+      - name: Configure Remote Desktop
+        shell: powershell
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Configurando Remote Desktop..."
+          Write-Host "======================================"
+
+          # Activar Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          # Mantener autenticación normal de Windows
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
+
+          # ------------------------------------------
+          # FIREWALL
+          # ------------------------------------------
+
+          $oldRule = Get-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue
+
+          if ($oldRule) {
+
+              Write-Host "Eliminando regla anterior..."
+
+              Remove-NetFirewallRule `
+                -DisplayName "RDP-Tailscale" `
+                -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Creando regla de firewall..."
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Profile Any
+
+          # Reiniciar servicio de Remote Desktop
+          Write-Host "Reiniciando servicio RDP..."
+
+          Restart-Service `
+            -Name TermService `
+            -Force
+
+          Write-Host ""
+          Write-Host "Remote Desktop configurado correctamente."
+          Write-Host ""
+
+
+      # ==========================================
+      # 2. CREAR / ACTUALIZAR USUARIO RDP
+      # ==========================================
+      - name: Configure RDP User
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Configurando usuario RDP..."
+          Write-Host "======================================"
+
+          # Comprobar contraseña
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+
+              Write-Error "El Secret RDP_PASSWORD no está configurado."
+
+              exit 1
+          }
+
+          # Convertir contraseña
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          # Buscar usuario
+          $existingUser = Get-LocalUser `
+            -Name "RDP" `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+
+              Write-Host "El usuario RDP ya existe."
+
+              # Actualizar contraseña
+              Set-LocalUser `
+                -Name "RDP" `
+                -Password $securePassword
+
+              Write-Host "Contraseña actualizada."
+
+          } else {
+
+              Write-Host "Creando usuario RDP..."
+
+              New-LocalUser `
+                -Name "RDP" `
+                -Password $securePassword `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -UserMayNotChangePassword
+
+              Write-Host "Usuario creado."
+          }
+
+          # ------------------------------------------
+          # GRUPO ADMINISTRADORES
+          # ------------------------------------------
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          # ------------------------------------------
+          # GRUPO REMOTE DESKTOP USERS
+          # ------------------------------------------
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          # Comprobar usuario
+          $checkUser = Get-LocalUser `
+            -Name "RDP" `
+            -ErrorAction SilentlyContinue
+
+          if (-not $checkUser) {
+
+              Write-Error "No se pudo crear/configurar el usuario RDP."
+
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Usuario RDP configurado correctamente."
+          Write-Host "La contraseña NO se mostrará en los logs."
+          Write-Host ""
+
+
+      # ==========================================
+      # 3. INSTALAR TAILSCALE
+      # ==========================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Instalando Tailscale..."
+          Write-Host "======================================"
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          # Descargar
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath
+
+          # Instalar
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
+          # Eliminar instalador
+          Remove-Item `
+            $installerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Tailscale instalado correctamente."
+          Write-Host ""
+
+
+      # ==========================================
+      # 4. CONECTAR TAILSCALE
+      # ==========================================
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Conectando Tailscale..."
+          Write-Host "======================================"
+
+          # Comprobar Secret
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+
+              Write-Error "El Secret TAILSCALE_AUTH_KEY no está configurado."
+
+              exit 1
+          }
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+
+              Write-Error "No se encontró tailscale.exe."
+
+              exit 1
+          }
+
+          # Conectar
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          # Obtener IP
+          $tsIP = $null
+
+          for ($i = 1; $i -le 20; $i++) {
+
+              $tsIP = (
+                & $tailscale ip -4 2>$null |
+                Select-Object -First 1
+              ).Trim()
+
+              if ($tsIP) {
+                  break
+              }
+
+              Write-Host "Esperando IP de Tailscale..."
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $tsIP) {
+
+              Write-Error "No se pudo obtener la IP de Tailscale."
+
+              exit 1
+          }
+
+          # Guardar IP para los siguientes pasos
+          "TAILSCALE_IP=$tsIP" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
+
+          Write-Host ""
+          Write-Host "Tailscale conectado correctamente."
+          Write-Host "IP: $tsIP"
+          Write-Host ""
+
+
+      # ==========================================
+      # 5. COMPROBAR RDP
+      # ==========================================
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Comprobando RDP..."
+          Write-Host "======================================"
+
+          Write-Host "IP de Tailscale: $env:TAILSCALE_IP"
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $result.TcpTestSucceeded) {
+
+              Write-Error "El puerto RDP 3389 no responde."
+
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "RDP está accesible correctamente."
+          Write-Host ""
+
+
+      # ==========================================
+      # 6. MANTENER RUNNER Y SESIÓN ACTIVOS
+      # ==========================================
+      - name: Keep Runner Alive
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "          RDP LISTO"
+          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "Dirección:"
+          Write-Host "$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "Usuario:"
+          Write-Host "RDP"
+          Write-Host ""
+          Write-Host "Contraseña:"
+          Write-Host "Usá la contraseña configurada en RDP_PASSWORD."
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "IMPORTANTE"
+          Write-Host "======================================"
+          Write-Host ""
+          Write-Host "Podés desconectar/cerrar el cliente RDP."
+          Write-Host "La sesión de Windows seguirá abierta."
+          Write-Host ""
+          Write-Host "No cierres sesión desde Windows."
+          Write-Host ""
+          Write-Host "El workflow mantendrá el runner activo."
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host ""
+
+          # Mantener vivo el workflow
+          while ($true) {
+
+              Write-Host "[$(Get-Date)] RDP activo - sesión disponible"
+
+              Start-Sleep -Seconds 300
+          }
